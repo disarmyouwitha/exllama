@@ -4,8 +4,8 @@
 #include "../matrix.cuh"
 
 const int THREADS_X = 16;
-const int THREADS_Y = 4;
-const int BLOCKSIZE_X = 4;
+const int THREADS_Y = 8;
+const int BLOCKSIZE_X = 16;
 
 // scratch = sum(x * x, dim = -1)
 
@@ -22,16 +22,28 @@ __global__ void rms_norm_row_product_kernel
     if (row >= rows) return;
     if (column >= dim) return;
 
+//     if (column == 0)
+//     {
+//         scratch[row] = 0.0f;
+//         __syncthreads();
+//     }
+
     // Accumulate
 
     float acc = 0.0f;
     int idx = row * dim + column;
+    half2* x_ptr = (half2*) &x[idx];
 
     #pragma unroll
-    for (int k = 0; k < BLOCKSIZE_X; k++)
+    for (int k = 0; k < BLOCKSIZE_X / 2; k++)
     {
-        float m = __half2float(x[idx++]);
-        acc = fma(m, m, acc);
+        half2 x2 = *x_ptr++;
+
+        float m0 = __half2float(x2.x);
+        float m1 = __half2float(x2.y);
+
+        acc = fma(m0, m0, acc);
+        acc = fma(m1, m1, acc);
     }
 
     atomicAdd(&scratch[row], acc);
@@ -79,7 +91,7 @@ __global__ void rms_norm_kernel
 //
 // works in-place if x == out
 
-cudaError_t rms_norm_cuda
+void rms_norm_cuda
 (
     half* x,
     const half* w,
@@ -90,10 +102,9 @@ cudaError_t rms_norm_cuda
     const int device_index
 )
 {
-    cudaError_t _cuda_err = cudaSuccess;
-
     CudaBuffers* buffers = get_buffers(device_index);
-    buffers->zero_rms_norm_scratch(rows);
+    float* temp = buffers->temp_rms_norm;
+    //cudaMemsetAsync(temp, 0, rows * sizeof(float));
 
     float r_dim = 1.0f / (float) dim;
 
@@ -106,12 +117,10 @@ cudaError_t rms_norm_cuda
         1
     );
 
-    rms_norm_row_product_kernel<<<blocks, threads>>>(x, buffers->rms_norm_scratch, rows, dim);
-    rms_norm_kernel<<<blocks, threads>>>(x, w, out, buffers->rms_norm_scratch, epsilon, r_dim, rows, dim);
+    rms_norm_row_product_kernel<<<blocks, threads>>>(x, temp, rows, dim);
+    rms_norm_kernel<<<blocks, threads>>>(x, w, out, temp, epsilon, r_dim, rows, dim);
 
-//_cuda_fail:
+    // Reset the temp buffer after use so it's always zeros. Faster this way
 
-    //if (scratch) cudaFree(scratch);
-
-    return _cuda_err;
+    cudaMemsetAsync(temp, 0, rows * sizeof(float));
 }

@@ -8,16 +8,16 @@
 
 #include "cpu_func/rep_penalty.h"
 
+#include "util.cuh"
 #include "cuda_buffers.cuh"
+#include "cuda_func/q4_matrix.cuh"
+#include "cuda_func/q4_matmul.cuh"
 #include "cuda_func/column_remap.cuh"
-#include "cuda_func/half_matmul.cuh"
-#include "cuda_func/q4v2_matmul.cuh"
-#include "cuda_func/q4v2_mlp.cuh"
-#include "cuda_func/q4v2_recons.cuh"
-#include "cuda_func/q4v2_sequential.cuh"
 #include "cuda_func/rms_norm.cuh"
 #include "cuda_func/rope.cuh"
-#include "util.cuh"
+#include "cuda_func/half_matmul.cuh"
+
+#include "cuda_func/q4_mlp.cuh"
 
 // Check CUDA return code. We don't want to include Torch headers in the .cu files because parsing them adds almost a
 // minute to the compile time on a 12900K. Also passing exceptions back to Python is super tricky, so in place of
@@ -77,162 +77,145 @@ int get_groupsize(torch::Tensor w, torch::Tensor w_zeros)
     return groupsize;
 }
 
+
 // Prepare buffers for forward pass
 
 void prepare_buffers
 (
     torch::Device device,
-    int rows,
-    int mlp_rows,
-    int intermediate_size,
-    int hidden_size
+    torch::Tensor temp_state,
+    torch::Tensor temp_mlp,
+    torch::Tensor temp_rms_norm,
+    torch::Tensor temp_dq
 )
 {
     int device_index = device.index();
     TORCH_CHECK_DEVICE_INDEX(device_index);
     const at::cuda::OptionalCUDAGuard device_guard(device);
 
-    check_cuda(
-        prepare_buffers_cuda
-        (
-            device_index,
-            rows,
-            mlp_rows,
-            intermediate_size,
-            hidden_size
-        )
+    prepare_buffers_cuda
+    (
+        device_index,
+        (half*) temp_state.data_ptr(),
+        (half*) temp_mlp.data_ptr(),
+        (float*) temp_rms_norm.data_ptr(),
+        (half*) temp_dq.data_ptr()
     );
 }
 
-void free_buffers
+
+// Create Q4Matrix, return handle
+
+uintptr_t make_q4
 (
-    torch::Device device
+    torch::Tensor qweight,
+    torch::Tensor qzeros,
+    torch::Tensor scales,
+    torch::Tensor g_idx,
+    int device
 )
 {
-    int device_index = device.index();
-    TORCH_CHECK_DEVICE_INDEX(device_index);
-    const at::cuda::OptionalCUDAGuard device_guard(device);
+    TORCH_CHECK_DTYPE(qweight, kInt);
+    TORCH_CHECK_DTYPE(qzeros, kInt);
+    TORCH_CHECK_DTYPE(scales, kHalf);
+    TORCH_CHECK_DTYPE_OPT(g_idx, kInt);
+    TORCH_CHECK_SHAPES(qweight, 1, qzeros, 1, 8);
+    TORCH_CHECK_SHAPES(scales, 1, qweight, 1, 1);
+    TORCH_CHECK_SHAPES(qzeros, 0, scales, 0, 1);
 
-    check_cuda(
-        free_buffers_cuda(device_index)
+    int width = qweight.size(1);
+    int height = qweight.size(0) * 8;
+    int groups = qzeros.size(0);
+
+    Q4Matrix* m = new Q4Matrix
+    (
+        height,
+        width,
+        groups,
+
+        (uint32_t*) qweight.data_ptr(),
+        (uint32_t*) qzeros.data_ptr(),
+        (half*) scales.data_ptr(),
+        g_idx.device().is_meta() ? NULL : (uint32_t*) g_idx.data_ptr(),
+
+        device
     );
+
+    g_q4_keep_matrix(m);
+    return reinterpret_cast<uintptr_t> (m);
 }
+
 
 // Matmul half @ quant -> half
 
-void q4v2_matmul
+void q4_matmul
 (
     torch::Tensor x,
-    torch::Tensor w,
+    uintptr_t w,
     torch::Tensor out,
-    torch::Tensor w_scales,
-    torch::Tensor w_zeros,
-    torch::Tensor seq_g_idx,
-    torch::Tensor x_map
+    int recons_thd  // min rows to reconstruct, 0 = never reconstruct
 )
 {
-    TORCH_CHECK_QUANT(w, w_scales, w_zeros, seq_g_idx, x_map);
+    Q4Matrix* wm = reinterpret_cast<Q4Matrix*> (w);
+
     TORCH_CHECK_DTYPE(x, kHalf);
-    TORCH_CHECK_SHAPE_MOD(x, 1, 256);
-    TORCH_CHECK_SHAPES(x, 1, w, 0, 8);
     TORCH_CHECK_DTYPE(out, kHalf);
+    TORCH_CHECK_SHAPES(x, 0, out, 0, 1);
+    TORCH_CHECK(wm->height == x.size(-1), "x and w have incompatible shapes")
 
-    int groupsize = get_groupsize(w, w_zeros);
-    int height = x.size(0);
-    int dim = x.size(1);
-    int width = w.size(1);
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
 
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(w_scales));
+    int x_height = x.size(0);
 
-    check_cuda(
-        q4v2_matmul_cuda
+    if (recons_thd == 0 || x_height < recons_thd)
+    {
+        q4_matmul_cuda
         (
             (half*) x.data_ptr(),
-            (uint32_t*) w.data_ptr(),
+            x_height,
+            wm,
+            (half*) out.data_ptr()
+        );
+    }
+    else
+    {
+        q4_matmul_recons_cuda
+        (
+            (half*) x.data_ptr(),
+            x_height,
+            wm,
             (half*) out.data_ptr(),
-            (half*) w_scales.data_ptr(),
-            (uint32_t*) w_zeros.data_ptr(),
-            height,
-            dim,
-            width,
-            groupsize,
-            seq_g_idx.device().is_meta() ? NULL : (uint16_t*) seq_g_idx.data_ptr(),
-            x_map.device().is_meta() ? NULL : (uint32_t*) x_map.data_ptr()
-        )
-    );
+            at::cuda::getCurrentCUDABlasHandle()
+        );
+    }
 }
 
-// Reconstruct half matrix from quant
+// Remap columns in half tensor
 
-void q4v2_recons
+void column_remap
 (
-    torch::Tensor w,
-    torch::Tensor out,
-    torch::Tensor w_scales,
-    torch::Tensor w_zeros,
-    torch::Tensor seq_g_idx,
+    torch::Tensor x,
+    torch::Tensor x_new,
     torch::Tensor x_map
 )
 {
-    TORCH_CHECK_QUANT(w, w_scales, w_zeros, seq_g_idx, x_map);
-    TORCH_CHECK_DTYPE(out, kHalf);
-
-    int groupsize = get_groupsize(w, w_zeros);
-    int height = w.size(0);
-    int width = w.size(1);
-
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(w_scales));
-
-    check_cuda(
-        q4v2_recons_cuda
-        (
-            (uint32_t*) w.data_ptr(),
-            (half*) out.data_ptr(),
-            (half*) w_scales.data_ptr(),
-            (uint32_t*) w_zeros.data_ptr(),
-            height,
-            width,
-            groupsize,
-            seq_g_idx.device().is_meta() ? NULL : (uint16_t*) seq_g_idx.data_ptr()
-        )
-    );
-}
-
-// Rearrange rows in w so group index is sequential, build new index and corresponding column map for matmul
-
-void q4v2_sequential
-(
-    torch::Tensor w,
-    torch::Tensor g_idx,        // size: w_height * 8
-    torch::Tensor seq_g_idx,    // size: w_height * 8 * 2
-    torch::Tensor x_map,        // size: w_height * 8
-    const int num_groups
-)
-{
-    TORCH_CHECK_DTYPE(w, kInt);
-    TORCH_CHECK_DTYPE(g_idx, kInt);
-    TORCH_CHECK_DTYPE(seq_g_idx, kShort);
+    TORCH_CHECK_DTYPE(x, kHalf);
+    TORCH_CHECK_DTYPE(x_new, kHalf);
     TORCH_CHECK_DTYPE(x_map, kInt);
-    TORCH_CHECK_SHAPES(g_idx, 0, x_map, 0, 1);
-    TORCH_CHECK_SHAPES(seq_g_idx, 0, g_idx, 0, 2);
-    TORCH_CHECK_SHAPES(g_idx, 0, w, 0, 8);
+    TORCH_CHECK_SHAPES(x_map, 0, x, 1, 1);
 
-    int height = w.size(0);
-    int width = w.size(1);
+    int height = x.size(0);
+    int width = x.size(1);
 
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(w));
+    const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
 
-    check_cuda(
-        q4v2_sequential_cuda
-        (
-            (uint32_t*) w.data_ptr(),
-            height,
-            width,
-            (uint32_t*) g_idx.data_ptr(),
-            (uint16_t*) seq_g_idx.data_ptr(),
-            (uint32_t*) x_map.data_ptr(),
-            num_groups
-        )
+    column_remap_cuda
+    (
+        (half*) x.data_ptr(),
+        (half*) x_new.data_ptr(),
+        height,
+        width,
+        (uint32_t*) x_map.data_ptr()
     );
 }
 
@@ -256,16 +239,14 @@ void half_matmul
 
     const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
 
-    check_cuda(
-        half_matmul_cuda
-        (
-            (half*) x.data_ptr(),
-            (half*) w.data_ptr(),
-            (half*) out.data_ptr(),
-            height,
-            dim,
-            width
-        )
+    half_matmul_cuda
+    (
+        (half*) x.data_ptr(),
+        (half*) w.data_ptr(),
+        (half*) out.data_ptr(),
+        height,
+        dim,
+        width
     );
 }
 
@@ -290,141 +271,56 @@ void half_matmul_cublas
     const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
     cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
 
-    check_cuda(
-        half_matmul_cublas_cuda
-        (
-            (half*) x.data_ptr(),
-            (half*) w.data_ptr(),
-            (half*) out.data_ptr(),
-            height,
-            dim,
-            width,
-            handle
-        )
-    );
-}
-
-// Remap columns in half tensor
-
-void column_remap
-(
-    torch::Tensor x,
-    torch::Tensor x_new,
-    torch::Tensor x_map
-)
-{
-    TORCH_CHECK_DTYPE(x, kHalf);
-    TORCH_CHECK_DTYPE(x_new, kHalf);
-    TORCH_CHECK_DTYPE(x_map, kInt);
-    TORCH_CHECK_SHAPES(x_map, 0, x, 1, 1);
-
-    int height = x.size(0);
-    int width = x.size(1);
-
-    const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
-
-    check_cuda(
-        column_remap_cuda
-        (
-            (half*) x.data_ptr(),
-            (half*) x_new.data_ptr(),
-            height,
-            width,
-            (uint32_t*) x_map.data_ptr()
-        )
+    half_matmul_cublas_cuda
+    (
+        (half*) x.data_ptr(),
+        (half*) w.data_ptr(),
+        (half*) out.data_ptr(),
+        height,
+        dim,
+        width,
+        handle
     );
 }
 
 // Llama MLP. Unfinished. Works on all models but is still 5% slower than regular MLP with quantized layers
 
-void q4v2_mlp
+void q4_mlp
 (
     torch::Tensor x,                // shape == (height, dim)
-    torch::Tensor out,              // shape == x.shape
+    torch::Tensor out,              // shape == (height, dim)
 
     torch::Tensor rms_norm_weight,  // shape == (x.shape[1],) == (dim,)
     float epsilon,
 
-    torch::Tensor gate,
-    torch::Tensor gate_scales,
-    torch::Tensor gate_zeros,
-    torch::Tensor gate_seq_g_idx,
-    torch::Tensor gate_x_map,
-
-    torch::Tensor up,
-    torch::Tensor up_scales,
-    torch::Tensor up_zeros,
-    torch::Tensor up_seq_g_idx,
-    torch::Tensor up_x_map,
-
-    torch::Tensor down,
-    torch::Tensor down_scales,
-    torch::Tensor down_zeros,
-    torch::Tensor down_seq_g_idx,
-    torch::Tensor down_x_map
+    uintptr_t gate,
+    uintptr_t up,
+    uintptr_t down
 )
 {
-    TORCH_CHECK_QUANT(gate, gate_scales, gate_zeros, gate_seq_g_idx, gate_x_map);
-    TORCH_CHECK_QUANT(up, up_scales, up_zeros, up_seq_g_idx, up_x_map);
-    TORCH_CHECK_QUANT(down, down_scales, down_zeros, down_seq_g_idx, down_x_map);
     TORCH_CHECK_DTYPE(x, kHalf);
     TORCH_CHECK_DTYPE(rms_norm_weight, kHalf);
-    TORCH_CHECK_SHAPES(x, 0, out, 0, 1);
-    TORCH_CHECK_SHAPES(x, 1, out, 1, 1);
-    TORCH_CHECK_SHAPES(x, 1, gate, 0, 8);
-    TORCH_CHECK_SHAPES(x, 1, up, 0, 8);
-    TORCH_CHECK_SHAPES(x, 1, down, 1, 1);
-    TORCH_CHECK_SHAPES(gate, 1, down, 0, 8);
-    TORCH_CHECK_SHAPE_MOD(x, 1, 256);
 
-    int gate_groupsize = get_groupsize(gate, gate_zeros);
-    int up_groupsize = get_groupsize(up, up_zeros);
-    int down_groupsize = get_groupsize(down, down_zeros);
     int height = x.size(0);
     int dim = x.size(1);
-    int width = gate.size(1);
 
     torch::Device device = x.device();
     int device_index = device.index();
     TORCH_CHECK_DEVICE_INDEX(device_index);
     const at::cuda::OptionalCUDAGuard device_guard(device);
 
-    check_cuda(
-        q4v2_mlp_cuda
-        (
-            (half*) x.data_ptr(),
-            (half*) out.data_ptr(),
-
-            (half*) rms_norm_weight.data_ptr(),
-            epsilon,
-
-            (uint32_t*) gate.data_ptr(),
-            (half*) gate_scales.data_ptr(),
-            (uint32_t*) gate_zeros.data_ptr(),
-            gate_seq_g_idx.device().is_meta() ? NULL : (uint16_t*) gate_seq_g_idx.data_ptr(),
-            gate_x_map.device().is_meta() ? NULL : (uint32_t*) gate_x_map.data_ptr(),
-            gate_groupsize,
-
-            (uint32_t*) up.data_ptr(),
-            (half*) up_scales.data_ptr(),
-            (uint32_t*) up_zeros.data_ptr(),
-            up_seq_g_idx.device().is_meta() ? NULL : (uint16_t*) up_seq_g_idx.data_ptr(),
-            up_x_map.device().is_meta() ? NULL : (uint32_t*) up_x_map.data_ptr(),
-            up_groupsize,
-
-            (uint32_t*) down.data_ptr(),
-            (half*) down_scales.data_ptr(),
-            (uint32_t*) down_zeros.data_ptr(),
-            down_seq_g_idx.device().is_meta() ? NULL : (uint16_t*) down_seq_g_idx.data_ptr(),
-            down_x_map.device().is_meta() ? NULL : (uint32_t*) down_x_map.data_ptr(),
-            down_groupsize,
-
-            height,
-            dim,
-            width,
-
-            device_index
-        )
+    q4_mlp_cuda
+    (
+        (half*) x.data_ptr(),
+        (half*) out.data_ptr(),
+        (half*) rms_norm_weight.data_ptr(),
+        epsilon,
+        reinterpret_cast<Q4Matrix*>(gate),
+        reinterpret_cast<Q4Matrix*>(up),
+        reinterpret_cast<Q4Matrix*>(down),
+        height,
+        dim,
+        device_index
     );
 }
 
@@ -454,23 +350,21 @@ void rms_norm
     TORCH_CHECK_DEVICE_INDEX(device_index);
     const at::cuda::OptionalCUDAGuard device_guard(device);
 
-    check_cuda(
-        rms_norm_cuda
-        (
-            (half*) x.data_ptr(),
-            (half*) w.data_ptr(),
-            (half*) out.data_ptr(),
-            epsilon,
-            rows,
-            dim,
-            device_index
-        )
+    rms_norm_cuda
+    (
+        (half*) x.data_ptr(),
+        (half*) w.data_ptr(),
+        (half*) out.data_ptr(),
+        epsilon,
+        rows,
+        dim,
+        device_index
     );
 }
 
 // RoPE rotary positional embeddings
 
-void rope
+void rope_
 (
     torch::Tensor x,
     torch::Tensor sin,
@@ -490,17 +384,15 @@ void rope
 
     const at::cuda::OptionalCUDAGuard device_guard(device_of(x));
 
-    check_cuda(
-        rope_cuda
-        (
-            (half*) x.data_ptr(),
-            (half*) sin.data_ptr(),
-            (half*) cos.data_ptr(),
-            rows,
-            head_dim,
-            num_heads,
-            past_len
-        )
+    rope_cuda
+    (
+        (half*) x.data_ptr(),
+        (half*) sin.data_ptr(),
+        (half*) cos.data_ptr(),
+        rows,
+        head_dim,
+        num_heads,
+        past_len
     );
 }
 
@@ -535,16 +427,15 @@ void rep_penalty
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
-  m.def("q4v2_matmul", &q4v2_matmul, "q4v2 matrix multiplication");
-  m.def("q4v2_mlp", &q4v2_mlp, "q4v2 llama mlp");
-  m.def("q4v2_recons", &q4v2_recons, "q4v2 matrix reconstruction");
-  m.def("q4v2_sequential", &q4v2_sequential, "q4v2 matrix serialization");
-  m.def("column_remap", &column_remap, "half matrix column remapping");
-  m.def("half_matmul", &half_matmul, "half matrix multiplication");
-  m.def("half_matmul_cublas", &half_matmul_cublas, "half matrix multiplication");
-  m.def("rms_norm", &rms_norm, "rms norm");
-  m.def("rope", &rope, "rotary position embeddings");
-  m.def("rep_penalty", &rep_penalty, "repetition penalty mask");
-  m.def("prepare_buffers", &prepare_buffers, "prepare buffers");
-  m.def("free_buffers", &free_buffers, "free buffers");
- }
+    m.def("prepare_buffers", &prepare_buffers, "prepare buffers");
+    m.def("make_q4", &make_q4, "make_q4");
+    m.def("q4_matmul", &q4_matmul, "q4_matmul");
+    m.def("q4_mlp", &q4_mlp, "q4_mlp");
+    m.def("column_remap", &column_remap, "column_remap");
+    m.def("rms_norm", &rms_norm, "rms_norm");
+    m.def("rope_", &rope_, "rope_");
+    m.def("half_matmul", &half_matmul, "half_matmul");
+    m.def("half_matmul_cublas", &half_matmul_cublas, "half_matmul_cublas");
+
+    m.def("rep_penalty", &rep_penalty, "repetition penalty mask");
+}
