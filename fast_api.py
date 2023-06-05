@@ -7,8 +7,8 @@ import uvicorn
 import requests
 from typing import Union
 from pathlib import Path
-from fastapi import FastAPI
 from pydantic import BaseModel
+from fastapi import FastAPI, BackgroundTasks
 from typing import Any, Dict, Optional, List
 from fastapi.templating import Jinja2Templates
 from fastapi.responses import StreamingResponse
@@ -68,6 +68,10 @@ app = FastAPI()
 semaphore = asyncio.Semaphore(1)
 templates = Jinja2Templates(directory = str(Path().resolve()))
 
+# workers
+nodes = ["wintermute:7862"]
+busy_nodes = set()
+
 # I need open CORS for my setup, you may not!!
 app.add_middleware(
     CORSMiddleware,
@@ -79,7 +83,7 @@ app.add_middleware(
 #-------
 
 
-# Chat. Just a wrapper for the HTML page. This way you can hit it from mobile on your network. =]
+# Chat. Just a wrapper for the HTML page. This way you can hit it from mobile on your network. =]ss
 @app.get("/")
 async def chat(request: Request, q: Union[str, None] = None):
     return templates.TemplateResponse("fastapi_chat.html", {"request": request, "host": socket.gethostname(), "port": _PORT})
@@ -99,6 +103,18 @@ def check():
     return { model }
 
 
+# You know.. just in case.
+@app.get("/kill")
+async def kill():
+    import signal
+
+    # Send the kill signal to terminate the script:
+    pid = os.getpid()
+    os.kill(pid, signal.SIGKILL)
+
+    return "Shutdown initiated."
+
+
 class GenerateRequest(BaseModel):
     message: str
     prompt: Optional[str] = None
@@ -111,8 +127,11 @@ class GenerateRequest(BaseModel):
     token_repetition_penalty_sustain: Optional[int] = 256
     token_repetition_penalty_decay: Optional[int] = None
     stream: Optional[bool] = True
-    # options:
-    #break_on_newline: Optional[str] = None
+    # [extra options]:
+    log: Optional[bool] = True
+    benchmark: Optional[bool] = False # change to benchmark in DB
+    #break_on_newline:
+    #custom_stopping_str
 
 
 @app.post("/generate")
@@ -185,6 +204,8 @@ async def stream_data(req: GenerateRequest):
                 # all done:
                 generator.end_beam_search() 
                 _full_answer = new_text
+                _params = ' '.join(sys.argv[1:])
+                _benchmark = req.benchmark
 
                 # get num new tokens:
                 prompt_tokens = tokenizer.encode(_MESSAGE)
@@ -200,6 +221,35 @@ async def stream_data(req: GenerateRequest):
                 #print(f"full answer: {_full_answer}")
 
                 print(f"Output generated in {_sec} ({_tokens_sec} tokens/s, {new_tokens}, context {prompt_tokens})")
+
+                if req.log==True:
+                    import pymysql
+
+                    # Establish a connection to the database:
+                    db_pw = os.environ.get('DB_PW')
+                    connection = pymysql.connect(
+                        host='localhost',
+                        user='nap',
+                        password=f'{db_pw}',
+                        database='wntr',
+                        charset='utf8mb4',
+                        cursorclass=pymysql.cursors.DictCursor
+                    )
+
+                    # Execute an insert query
+                    try:
+                        with connection.cursor() as cursor:
+                            model = os.path.basename(args.model).replace(".safetensors", "")
+                            sql = "INSERT INTO llm_logs (model, temp, prompt, question, answer, new_tokens, token_sec, bits_loaded, context, run_params, benchmark) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+                            values = (model, req.temperature, req.prompt, req.message, _full_answer, new_tokens, _tokens_sec, 4, prompt_tokens, _params, _benchmark)
+
+                            # insert into DB:
+                            cursor.execute(sql, values)
+                            connection.commit()
+                            #print(cursor.rowcount, "record inserted.")
+                    finally:
+                        # Close the connection
+                        connection.close()
 
             return StreamingResponse(generate_simple(_MESSAGE, req.max_new_tokens))
         else:
@@ -232,6 +282,38 @@ async def stream_data(req: GenerateRequest):
 
     finally:
         semaphore.release()
+#-------
+
+
+@app.post("/ask")
+async def ask_endpoint(request: Request):
+    data = await request.json()
+
+    global nodes, busy_nodes
+
+
+    for node in nodes:
+        if node in busy_nodes:
+            continue
+
+        node_url = f"http://{node}/generate"
+
+        try:
+            busy_nodes.add(node)
+
+            print(f"Trying on {node_url}")
+
+            #async with aiohttp.ClientSession() as session: (??? async instead?)
+            r = requests.post(f"{node_url}", data=json.dumps(data), stream=True)
+            return StreamingResponse(r.iter_content())
+
+        except Exception as e:
+            print.info(f"Node unreachable: {node_url}")
+            pass
+        finally:
+            busy_nodes.remove(node)
+
+    raise HTTPException(status_code=503, detail="All nodes are currently unavailable")
 #-------
 
 
