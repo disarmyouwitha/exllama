@@ -143,5 +143,5 @@ session = get_initial_session()
 
 # Start the web server
 
-Timer(1, lambda: webbrowser.open('http://127.0.0.1:5000/')).start()
-app.run()
+#Timer(1, lambda: webbrowser.open('http://127.0.0.1:5000/')).start()
+app.run(host="0.0.0.0", port="7862")
