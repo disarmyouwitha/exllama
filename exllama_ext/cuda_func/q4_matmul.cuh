@@ -8,9 +8,17 @@
 #include <ATen/cuda/CUDAContext.h>
 
 #include "q4_matrix.cuh"
+#include "../tuning.h"
+
+// Workaround for hipify_python using rocblas instead of hipblas.
+#if defined(USE_ROCM)
+#include <hipblas/hipblas.h>
+#define rocblas_handle hipblasHandle_t
+#endif
 
 void q4_matmul_cuda
 (
+    ExLlamaTuning* tuningParams,
     const half* x,
     const int x_height,
     const Q4Matrix* w,
@@ -20,6 +28,7 @@ void q4_matmul_cuda
 
 void q4_matmul_recons_cuda
 (
+    ExLlamaTuning* tuningParams,
     const half* x,
     const int x_height,
     Q4Matrix* w,

@@ -75,7 +75,25 @@ class ExLlamaConfig:
 
         self.matmul_recons_thd = 8
         self.fused_mlp_thd = 2
-        self.stp_thd = 8
+        self.sdp_thd = 8
+        self.matmul_fused_remap = False
+        self.rmsnorm_no_half2 = False
+        self.rope_no_half2 = False
+        self.matmul_no_half2 = False
+        self.silu_no_half2 = False
+
+    # Copy tuning params to C++ extension
+
+    def set_tuning_params(self):
+
+        cuda_ext.exllama_ext.set_tuning_params(self.matmul_recons_thd,
+                                               self.fused_mlp_thd,
+                                               self.sdp_thd,
+                                               self.matmul_fused_remap,
+                                               self.rmsnorm_no_half2,
+                                               self.rope_no_half2,
+                                               self.matmul_no_half2,
+                                               self.silu_no_half2)
 
     # Parse and set list of GPU VRAM allocations
 
@@ -102,11 +120,11 @@ def _dump_tensor(t, name):
 
 # 4-bit linear layer implementation
 
-#class Ex4bitLinear:
-class Ex4bitLinear(nn.Module):
+class Ex4bitLinear:
+# class Ex4bitLinear(nn.Module):
 
     def __init__(self, config, in_features, out_features, has_bias, tensors, key):
-        super().__init__()
+        # super().__init__()
 
         self.config = config
         self.key = key
@@ -148,37 +166,17 @@ class Ex4bitLinear(nn.Module):
             self.config.act_order = True
 
 
-    def quant_args(self):
-
-        return {"qweight": self.qweight,
-                "scales": self.scales,
-                "zeros": self.qzeros,
-                "seq_g_idx": self.seq_g_idx,
-                "x_map": self.x_map}
-
-
     def forward(self, x):
 
-        out = cuda_ext.ext_q4_matmul(x, self.q4, self.width, self.config.matmul_recons_thd)
+        out = cuda_ext.ext_q4_matmul(x, self.q4, self.width)
         if self.bias is not None: out.add_(self.bias)
         return out
-
-
-    def dump(self, filename):
-
-        _dump_tensor(self.qweight, filename + ".qweight")
-        _dump_tensor(self.scales, filename + ".scales")
-        _dump_tensor(self.qzeros, filename + ".qzeros")
-        _dump_tensor(self.seq_g_idx, filename + ".seq_g_idx")
-        _dump_tensor(self.x_map, filename + ".x_map")
-        _dump_tensor(self.bias, filename + ".bias")
 
 
     def debug(self, name):
 
         print(f" !!  - {name}: {self.qweight.device} ", end = "")
         print(f"[Q", end = "")
-        if self.seq_g_idx is not None: print(f",seq_g_idx", end = "")
         if self.x_map is not None: print(f",x_map", end = "")
         if self.bias is not None: print(f",bias", end = "")
         print(f"]", end = "")
@@ -194,11 +192,11 @@ class Ex4bitLinear(nn.Module):
 
 # Llama MLP
 
-# class ExLlamaMLP:
-class ExLlamaMLP(nn.Module):
+class ExLlamaMLP:
+# class ExLlamaMLP(nn.Module):
 
     def __init__(self, config, tensors, key):
-        super().__init__()
+        # super().__init__()
 
         self.config = config
 
@@ -218,22 +216,14 @@ class ExLlamaMLP(nn.Module):
 
         return y
 
-        # self.gate_proj.dump("cuda_test/mlp/gate_proj")
-        # self.up_proj.dump("cuda_test/mlp/up_proj")
-        # self.down_proj.dump("cuda_test/mlp/down_proj")
-        # _dump_tensor(x, "cuda_test/mlp/test_mlp_x")
-        # _dump_tensor(y, "cuda_test/mlp/test_mlp_x_gated")
-        # _dump_tensor(x, "cuda_test/mlp/test_mlp_x_done")
-        # sys.exit()
-
 
 # RMS Layer norm.
 
-# class ExLlamaRMSNorm:
-class ExLlamaRMSNorm(nn.Module):
+class ExLlamaRMSNorm:
+# class ExLlamaRMSNorm(nn.Module):
 
     def __init__(self, config, tensors, key):
-        super().__init__()
+        # super().__init__()
 
         self.config = config
         self.variance_epsilon = self.config.rms_norm_eps
@@ -253,11 +243,11 @@ class ExLlamaRMSNorm(nn.Module):
 
 # Llama attention
 
-# class ExLlamaAttention:
-class ExLlamaAttention(nn.Module):
+class ExLlamaAttention:
+# class ExLlamaAttention(nn.Module):
 
     def __init__(self, config, tensors, key, sin, cos, index):
-        super().__init__()
+        # super().__init__()
 
         self.config = config
         self.sin = sin
@@ -280,8 +270,8 @@ class ExLlamaAttention(nn.Module):
         query_states = self.q_proj.forward(hidden_states)
         key_states = self.k_proj.forward(hidden_states)
 
-        cuda_ext.ext_rope_(query_states, self.sin, self.cos, past_len, self.config.num_attention_heads, self.config.head_dim)
-        cuda_ext.ext_rope_(key_states, self.sin, self.cos, past_len, self.config.num_attention_heads, self.config.head_dim)
+        cuda_ext.exllama_ext.rope_(query_states, self.sin, self.cos, past_len, self.config.num_attention_heads, self.config.head_dim)
+        cuda_ext.exllama_ext.rope_(key_states, self.sin, self.cos, past_len, self.config.num_attention_heads, self.config.head_dim)
 
         query_states = query_states.view(bsz, q_len, self.config.num_attention_heads, self.config.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.config.num_attention_heads, self.config.head_dim).transpose(1, 2)
@@ -309,7 +299,7 @@ class ExLlamaAttention(nn.Module):
 
             attn_weights = torch.matmul(query_states, key_states.transpose(2, 3))
             attn_weights /= math.sqrt(self.config.head_dim)
-            if buffer.attn_mask.shape[2] > 1: attn_weights = attn_weights + buffer.attn_mask
+            if buffer.attn_mask is not None and buffer.attn_mask.shape[2] > 1: attn_weights = attn_weights + buffer.attn_mask
             # attn_weights = torch.max(attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min))
             attn_weights = nn.functional.softmax(attn_weights, dim = -1, dtype = torch.float16).to(query_states.dtype)
             attn_output = torch.matmul(attn_weights, value_states)
@@ -321,10 +311,9 @@ class ExLlamaAttention(nn.Module):
 
             # Torch's SDP attention has a built-in causal mask feature which we can use only when there is no past, i.e.
             # it can only apply a square attention mask. It saves quite a bit of VRAM but in practice Torch seems to use
-            # the same amount of memory at peak anyway. It's also a little slower, and it gives misleading benchmarks
-            # since it doesn't actually apply in the case we're interested in (autoregression.) Disabled for now.
+            # the same amount of memory at peak anyway.
 
-            if True or past_len > 0:
+            if past_len > 0:
                 attn_output = F.scaled_dot_product_attention(query_states, key_states, value_states, attn_mask = buffer.attn_mask, is_causal = False)
             else:
                 attn_output = F.scaled_dot_product_attention(query_states, key_states, value_states, attn_mask = None, is_causal = True)
@@ -344,11 +333,11 @@ def _rows(x):
     for y in x.shape[:-1]: xdp *= y
     return xdp
 
-# class ExLlamaDecoderLayer:
-class ExLlamaDecoderLayer(nn.Module):
+class ExLlamaDecoderLayer:
+# class ExLlamaDecoderLayer(nn.Module):
 
     def __init__(self, config, tensors, key, index, sin, cos):
-        super().__init__()
+        # super().__init__()
 
         self.config = config
         self.index = index
@@ -553,7 +542,7 @@ class ExLlamaBuffer:
     def to(self, device):
 
         new = ExLlamaBuffer(self.config)
-        new.attn_mask = _move_tensor(self.attn_mask, device, "attn_mask", self.config)
+        new.attn_mask = None if self.attn_mask is None else _move_tensor(self.attn_mask, device, "attn_mask", self.config)
         return new
 
 
@@ -598,12 +587,12 @@ def _move_tensor(tensor, new_device, name, config):
     return tensor.to(new_device)
 
 
-# class ExLlama:
-class ExLlama(nn.Module):
+class ExLlama:
+# class ExLlama(nn.Module):
 
     def __init__(self, config):
-        super().__init__()
-        self.eval()
+        # super().__init__()
+        # self.eval()
 
         self.config = config
 
@@ -612,6 +601,10 @@ class ExLlama(nn.Module):
             print(f" !! Available CUDA devices:")
             for i in range(device_count):
                 print(f'" !!  - cuda:{i}: {torch.cuda.get_device_name(i)}')
+
+        # Copy tuning parameters to C++ extension
+
+        self.config.set_tuning_params()
 
         # Load model weights
 
@@ -767,8 +760,8 @@ class ExLlama(nn.Module):
 
             modules.append(layer)
 
-        # self.layers = modules
-        self.layers = nn.ModuleList(modules)
+        self.layers = modules
+        # self.layers = nn.ModuleList(modules)
 
         # Prepare CUDA buffers
 
@@ -780,19 +773,19 @@ class ExLlama(nn.Module):
 
             temp_state = torch.zeros((config.max_seq_len, config.intermediate_size), dtype = torch.float16, device = dev)
             temp_mlp = torch.zeros((config.fused_mlp_thd * 2, config.intermediate_size), dtype = torch.float16, device = dev)
-            temp_rms_norm = torch.zeros((1, config.max_seq_len), dtype = torch.float32, device = dev)
+            temp_zeros_float = torch.zeros((1, 65536), dtype = torch.float32, device = dev)
             temp_dq = torch.zeros((1, max_dq_buffer_size), dtype = torch.float16, device = dev)
 
             device_buffers["temp_state"] = temp_state
             device_buffers["temp_mlp"] = temp_mlp
-            device_buffers["temp_rms_norm"] = temp_rms_norm
+            device_buffers["temp_zeros_float"] = temp_zeros_float
             device_buffers["temp_dq"] = temp_dq
 
-            cuda_ext.ext_prepare_cuda_buffers(torch.device(dev),
-                                              temp_state,
-                                              temp_mlp,
-                                              temp_rms_norm,
-                                              temp_dq)
+            cuda_ext.exllama_ext.prepare_buffers(torch.device(dev),
+                                                 temp_state,
+                                                 temp_mlp,
+                                                 temp_zeros_float,
+                                                 temp_dq)
 
 
     def forward(self, input_ids, cache, last_id_only = True, preprocess_only = False):
@@ -816,14 +809,11 @@ class ExLlama(nn.Module):
             attn_mask = torch.zeros(batch_size, 1, seq_len, past_len + seq_len, dtype = torch.float16, device = devs[0])
             attn_mask_triu = torch.triu(torch.full((seq_len - 1, seq_len - 1), torch.finfo(torch.float16).min))
             attn_mask[:, :, : seq_len - 1, past_len + 1: past_len + seq_len] = attn_mask_triu
-            # attn_mask = torch.ones(batch_size, 1, seq_len, past_len + seq_len, dtype = torch.bool, device = devs[0])
-            # attn_mask_triu = ~torch.triu(torch.ones((seq_len - 1, seq_len - 1), dtype = torch.bool), diagonal = 0)
-            # attn_mask[:, :, : seq_len - 1, past_len + 1: past_len + seq_len] = attn_mask_triu
 
         else:
 
-            attn_mask = torch.zeros(batch_size, 1, seq_len, seq_len + past_len, dtype = torch.float16, device = devs[0])
-            # attn_mask = torch.ones(batch_size, 1, seq_len, seq_len + past_len, dtype = torch.bool, device = devs[0])
+            attn_mask = None
+            # attn_mask = torch.zeros(batch_size, 1, seq_len, seq_len + past_len, dtype = torch.float16, device = devs[0])
 
         buffer.attn_mask = attn_mask
 
