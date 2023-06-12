@@ -1,26 +1,18 @@
 # ExLlama
 
-A rewrite of the HF transformers implementation of Llama with the following goals, among others:
+A standalone Python/C++/CUDA implementation of Llama for use with 4-bit GPTQ weights, designed to be fast and
+memory-efficient on modern GPUs.
 
-* Designed for use with quantized weights
-* Fast and memory-efficient inference (not just attention)
-* Mapping across multiple devices
-* Built-in (multi) LoRA support
-* Companion library of funky sampling functions
+Disclaimer: The project is coming along, but it's still a work in progress!
 
-Disclaimer: This is currently a preview of a work in progress. Or maybe a proof of concept. Either way any part of it
-is subject to change.
+## Hardware requirements
 
-## Hardware/software requirements
-
-I am developing on an RTX 4090 and an RTX 3090-Ti. Both cards support the CUDA kernel, but there might be
-incompatibilities with older cards. I have no way of testing that right now.
+I am developing on an RTX 4090 and an RTX 3090-Ti. Both cards support the CUDA kernels, but there might be
+incompatibilities with older cards.
 
 ## Dependencies
 
-This list might be incomplete:
-
-* `torch` tested on 2.1.0 (nightly) with cu118
+* `torch` tested on 2.0.1 and 2.1.0 (nightly) with cu118
 * `safetensors` 0.3.1
 * `sentencepiece`
 * `ninja`
@@ -28,7 +20,7 @@ This list might be incomplete:
 
 ## Linux/WSL prerequisites
 
-    pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu118
+    pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu118
 
 ## Windows prerequisites
 
@@ -69,7 +61,7 @@ I made a simple web UI for it. Like the rest of the project, it's a work in prog
 it was mostly written by ChatGPT and it will haunt your dreams. But it sort of works, and it's kinda fun, especially
 multibot mode:
 
-![_screenshot.jpg](_screenshot.jpg)
+![_screenshot.jpg](doc/_screenshot.jpg)
 
 To run it:
 
@@ -79,18 +71,60 @@ To run it:
 
 Note that sessions are stored in `~/exllama_sessions/`. 
 
+## Docker
+For security benefits and easier deployment, it is also possible to run the web UI in an isolated docker container. Note: the docker image currently only supports NVIDIA GPUs.
+
+### Requirements
+- [Docker](https://docs.docker.com/engine/install/)
+- [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)
+
+It is recommended to run docker in [rootless mode](https://docs.docker.com/engine/security/rootless/).
+
+### Build
+
+The easiest way to build the docker image is using docker compose. First, set the `MODEL_PATH` and `SESSIONS_PATH` variables in the `.env` file to the actual directories on the host. Then run:
+
+```
+docker compose build
+```
+
+It is also possible to manually build the image:
+
+```
+docker build -t exllama-web
+```
+
+### Run
+
+Using docker compose:
+
+```
+docker compose up
+```
+
+The web UI can now be accessed on the host at http://localhost:5000.
+
+The configuration can be viewed in `docker-compose.yml` and changed by creating a `docker-compose.override.yml` file.
+
+Run manually: 
+
+```
+docker run --gpus all -p 5000:5000 -v <path_to_model_files>:/app/model/ --rm -it exllama-web --host 0.0.0.0:5000
+```
+
+
 ## Results so far
 
 ### New implementation
 | Model    | Size | grpsz | act             | Seq. len.            | VRAM      | Prompt     | Best    | Worst   | Ppl  |
 |----------|------|-------|-----------------|----------------------|-----------|------------|---------|---------|------|
-| Llama    | 7B   | 128   | no              | 2,048 t              | 5,194 MB  | 10,460 t/s | 160 t/s | 133 t/s | 6.45 |
-| Llama    | 13B  | 128   | no              | 2,048 t              | 9,127 MB  | 5,831 t/s  | 97 t/s  | 83 t/s  | 5.60 |
-| Llama    | 30B  | 128   | no              | 2,048 t              | 20,795 MB | 2,481 t/s  | 46 t/s  | 39 t/s  | 4.60 |
-| Llama    | 30B  | 128   | yes             | 2,048 t              | 20,795 MB | 2,343 t/s  | 44 t/s  | 37 t/s  | 4.55 |
-| Llama    | 30B  | 32    | yes             | 1,550 t <sup>1</sup> | 21,486 MB | 2,308 t/s  | 40 t/s  | 36 t/s  | 4.52 |
-| Koala    | 13B  | 128   | yes             | 2,048 t              | 9,127 MB  | 5,529 t/s  | 86 t/s  | 79 t/s  | 6.73 |
-| WizardLM | 30B  | -     | no <sup>2</sup> | 2,048 t              | 20,199 MB | 2,313 t/s  | 44 t/s  | 39 t/s  | 5.75 |
+| Llama    | 7B   | 128   | no              | 2,048 t              | 5,194 MB  | 13,918 t/s | 173 t/s | 140 t/s | 6.45 |
+| Llama    | 13B  | 128   | no              | 2,048 t              | 9,127 MB  | 7,507 t/s  | 102 t/s | 86 t/s  | 5.60 |
+| Llama    | 30B  | 128   | no              | 2,048 t              | 20,795 MB | 2,959 t/s  | 47 t/s  | 40 t/s  | 4.60 |
+| Llama    | 30B  | 128   | yes             | 2,048 t              | 20,795 MB | 2,784 t/s  | 45 t/s  | 37 t/s  | 4.55 |
+| Llama    | 30B  | 32    | yes             | 1,550 t <sup>1</sup> | 21,486 MB | 2,636 t/s  | 41 t/s  | 37 t/s  | 4.52 |
+| Koala    | 13B  | 128   | yes             | 2,048 t              | 9,127 MB  | 5,529 t/s  | 93 t/s  | 79 t/s  | 6.73 |
+| WizardLM | 30B  | -     | no <sup>2</sup> | 2,048 t              | 20,199 MB | 2,313 t/s  | 47 t/s  | 40 t/s  | 5.75 |
 
 <sup>1</sup> Can not achieve full sequence length without OoM (yet)  
 <sup>2</sup> Not quite sure if this is act-order or not. Weights have no group index, at least   
@@ -114,10 +148,10 @@ WikiText, so scores are not necessarily comparable to other Llama benchmarks.
 Since many seem to be interested in running 65B models, I can confirm that this works with two 24 GB GPUs. The
 following benchmarks are from a 4090 + 3090-Ti with `-gs 17.2,24`:
 
-| Model    | Size | groupsize | act | Seq. len.            | VRAM      | Prompt  | Best   | Worst  | Ppl  |
-|----------|------|-----------|-----|----------------------|-----------|---------|--------|--------|------|
-| Llama    | 65B  | 128       | yes | 2,048 t              | 39,804 MB | 990 t/s | 20 t/s | 18 t/s | 4.20 |
-| Llama    | 65B  | 32        | yes | 2,048 t              | 43,424 MB | 976 t/s | 17 t/s | 16 t/s | 4.11 |
+| Model    | Size | groupsize | act | Seq. len.            | VRAM      | Prompt    | Best   | Worst  | Ppl  |
+|----------|------|-----------|-----|----------------------|-----------|-----------|--------|--------|------|
+| Llama    | 65B  | 128       | yes | 2,048 t              | 39,804 MB | 1,109 t/s | 20 t/s | 18 t/s | 4.20 |
+| Llama    | 65B  | 32        | yes | 2,048 t              | 43,424 MB | 1,037 t/s | 17 t/s | 16 t/s | 4.11 |
 
 
 ### Testing long sequences
@@ -136,23 +170,14 @@ speeds are no longer current.
 
 ## Todo
 
-Moved the todo list [here](TODO.md).  
+Moved the todo list [here](doc/TODO.md).  
 
 ## Compatibility
 
-I downloaded a whole bunch of GPTQ models to test compatibility. [Here](model_compatibility.md) is the list of models
+I downloaded a whole bunch of GPTQ models to test compatibility. [Here](doc/model_compatibility.md) is the list of models
 confirmed to be working right now.
 
 ## Recent updates
-
-**2023-05-22**: Added option to auto-split layers across multiple GPUs based on VRAM allocation. 
-
-**2023-05-22**: Added option to dequantize layers at load-time which _should_ speed up inference, but it turns out
-Torch's fp16 matmul is actually slower than the quantized matmul. Maybe bandwidth is the only bottleneck right now?
-Need to experiment some more.
-
-**2023-05-24**: Downloaded a bunch of models from HF and set up a test script. Should be a good sampling of the most
-popular finetunes right now. I'll add more to the list as I come across them. They all seem to be working.
 
 **2023-05-24**: Added fused rotary embeddings and some minor optimizations. 13% faster on 7B, 9% on 13B. Small
 improvement on larger models. Added best-case scores to benchmark results and some clarification. For easier
@@ -177,3 +202,13 @@ options to come soon and eventually auto tuning. Also optimized a little, for ab
 
 **2024-06-06**: Some minor optimizations. Also it should now compile the extension more easily and run more seamlessly
 on Windows.
+
+**2024-06-09**: Fused most of the self-attention step. More to come. Slight speedup already, but more importantly went
+from 69% actual CPU utilization to 37%. This should do a lot to address the bottleneck on CPUs with lower 
+single-threaded performance.
+
+**2024-06-10**: Docker support now! And some minor optimizations. Cleaned up the project a bit.
+
+**2024-06-11**: Added some concurrency a couple of places. It's only beneficial on the 4090, on small models where the
+cores are somewhat underutilized and the L2 cache can keep up. For the 3090 it's detrimental to performance, so it's
+disabled by default. YMMV. Use `-cs` to try it out.

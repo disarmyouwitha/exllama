@@ -8,6 +8,10 @@
 
 const int CUDA_MAX_DEVICES = 16;
 
+// #ifndef _cuda_buffers_cu
+// extern __constant__ half2 q4_table[16][256];
+// #endif
+
 class CudaBuffers
 {
 public:
@@ -20,6 +24,13 @@ public:
 
     int current_zeros_float;
     int max_zeros_float;
+
+    cudaStream_t alt_stream_1;
+    cudaStream_t alt_stream_2;
+    cudaStream_t alt_stream_3;
+    cudaEvent_t alt_stream_1_done;
+    cudaEvent_t alt_stream_2_done;
+    cudaEvent_t alt_stream_3_done;
 
     CudaBuffers
     (

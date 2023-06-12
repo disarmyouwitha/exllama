@@ -6,12 +6,23 @@ const int THREADS_X = 32;
 const int THREADS_Y = 4;
 const int MAX_POS_EMBEDDINGS = 32768;  // Actual number doesn't matter
 
+typedef void (*fp_rope_cuda_kernel)
+(
+    half*,
+    const half*,
+    const half*,
+    int,
+    int,
+    int,
+    int
+);
+
 template<bool use_half2>
 __global__ void rope_cuda_kernel
 (
-    half* x,
-    const half* sin,
-    const half* cos,
+    half* __restrict__ x,
+    const half* __restrict__ sin,
+    const half* __restrict__ cos,
     int rows,
     int head_dim,
     int num_heads,
@@ -73,6 +84,16 @@ __global__ void rope_cuda_kernel
     }
 }
 
+fp_rope_cuda_kernel rope_cuda_kernel_pick(ExLlamaTuning* tuningParams)
+{
+    // <bool use_half2>
+    if (tuningParams->matmul_no_half2) {
+        return rope_cuda_kernel<false>;
+    } else {
+        return rope_cuda_kernel<true>;
+    }
+};
+
 void rope_cuda
 (
     ExLlamaTuning* tuningParams,
@@ -82,7 +103,8 @@ void rope_cuda
     const int rows,
     const int head_dim,
     const int num_heads,
-    const int past_len
+    const int past_len,
+    cudaStream_t alt_stream
 )
 {
     dim3 threads(THREADS_X, THREADS_Y, 1);
@@ -94,12 +116,6 @@ void rope_cuda
         1
     );
 
-    if (tuningParams->rope_no_half2)
-    {
-        rope_cuda_kernel<false><<<blocks, threads>>>(x, sin, cos, rows, head_dim, num_heads, past_len);
-    }
-    else
-    {
-        rope_cuda_kernel<true><<<blocks, threads>>>(x, sin, cos, rows, head_dim, num_heads, past_len);
-    }
+    fp_rope_cuda_kernel kernel = rope_cuda_kernel_pick(tuningParams);
+    kernel<<<blocks, threads, 0, alt_stream>>>(x, sin, cos, rows, head_dim, num_heads, past_len);
 }

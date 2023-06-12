@@ -34,11 +34,19 @@ __device__ __forceinline__ half2 silu(half2 x)
     return result;
 }
 
+typedef void (*fp_silu_mul_cuda_kernel)
+(
+    half*,
+    const half*,
+    const int,
+    const int
+);
+
 template <bool use_half2>
 __global__ void silu_mul_cuda_kernel
 (
-    half* x,
-    const half* y,
+    half* __restrict__ x,
+    const half* __restrict__ y,
     const int height,
     const int width
 )
@@ -78,6 +86,16 @@ __global__ void silu_mul_cuda_kernel
     }
 }
 
+fp_silu_mul_cuda_kernel silu_mul_cuda_kernel_pick(ExLlamaTuning* tuningParams)
+{
+    // <bool use_half2>
+    if (tuningParams->matmul_no_half2) {
+        return silu_mul_cuda_kernel<false>;
+    } else {
+        return silu_mul_cuda_kernel<true>;
+    }
+};
+
 void q4_mlp_cuda
 (
     ExLlamaTuning* tuningParams,
@@ -96,14 +114,33 @@ void q4_mlp_cuda
 
     // temp_x = rms_layernorm(x)
 
-    half* temp_x = buffers->temp_state + height * dim;
+    half* temp_x = buffers->temp_state + height * dim;  // TOOD: ..
     rms_norm_cuda(tuningParams, x, rms_norm_weight, temp_x, epsilon, height, dim, device_index);
 
-    // temp_mlp[0] = temp_x @ gate
-    // temp_mlp[1] = temp_x @ up
+    if (!tuningParams->concurrent_streams)
+    {
+        // temp_mlp[0] = temp_x @ gate
+        // temp_mlp[1] = temp_x @ up
 
-    q4_matmul_cuda(tuningParams, temp_x, height, gate, buffers->temp_mlp);
-    q4_matmul_cuda(tuningParams, temp_x, height, up, buffers->temp_mlp + height * up->width);
+        q4_matmul_cuda(tuningParams, temp_x, height, gate, buffers->temp_mlp);
+        q4_matmul_cuda(tuningParams, temp_x, height, up, buffers->temp_mlp + height * up->width);
+    }
+    else
+    {
+        cudaStream_t str_1 = buffers->alt_stream_1;
+        cudaStream_t str_2 = buffers->alt_stream_2;
+        cudaEvent_t sync_1 = buffers->alt_stream_1_done;
+        cudaEvent_t sync_2 = buffers->alt_stream_2_done;
+
+        q4_matmul_cuda(tuningParams, temp_x, height, gate, buffers->temp_mlp, false, str_1);
+        cudaEventRecord(sync_1, str_1);
+
+        q4_matmul_cuda(tuningParams, temp_x, height, up, buffers->temp_mlp + height * up->width, false, str_2);
+        cudaEventRecord(sync_2, str_2);
+
+        cudaStreamWaitEvent(NULL, sync_1, 0);
+        cudaStreamWaitEvent(NULL, sync_2, 0);
+    }
 
     // temp_mlp[0] = silu(temp_mlp[0]) * temp_mlp[1]
 
@@ -116,26 +153,8 @@ void q4_mlp_cuda
         1
     );
 
-    if (tuningParams->silu_no_half2)
-    {
-        silu_mul_cuda_kernel<false><<<blocks, threads>>>
-        (
-            buffers->temp_mlp,
-            buffers->temp_mlp + height * up->width,
-            height,
-            up->width
-        );
-    }
-    else
-    {
-        silu_mul_cuda_kernel<true><<<blocks, threads>>>
-        (
-            buffers->temp_mlp,
-            buffers->temp_mlp + height * up->width,
-            height,
-            up->width
-        );
-    }
+    fp_silu_mul_cuda_kernel kernel = silu_mul_cuda_kernel_pick(tuningParams);
+    kernel<<<blocks, threads>>>(buffers->temp_mlp, buffers->temp_mlp + height * up->width, height, up->width);
 
     // x += temp1 @ down (implicitly add the residual connection by not zeroing the output in the matmul)
 

@@ -9,11 +9,19 @@ const int BLOCKSIZE_X = 16;
 
 // scratch = sum(x * x, dim = -1)
 
+typedef void (*fp_rms_norm_row_product_kernel)
+(
+    half*,
+    float*,
+    const int,
+    const int
+);
+
 template<bool use_half2>
 __global__ void rms_norm_row_product_kernel
 (
-    half* x,
-    float* scratch,
+    half* __restrict__ x,
+    float* __restrict__ scratch,
     const int rows,
     const int dim
 )
@@ -72,13 +80,25 @@ __global__ void rms_norm_row_product_kernel
 
 // x = x * w / sqrt(scratch / dim + epsilon)
 
+typedef void (*fp_rms_norm_kernel)
+(
+    half*,
+    const half*,
+    half*,
+    float*,
+    const float,
+    const float,
+    const int,
+    const int
+);
+
 template<bool use_half2>
 __global__ void rms_norm_kernel
 (
-    half* x,
-    const half* w,
-    half* out,
-    float* scratch,
+    half* __restrict__ x,
+    const half* __restrict__ w,
+    half* __restrict__ out,
+    float* __restrict__ scratch,
     const float epsilon,
     const float r_dim,
     const int rows,
@@ -131,6 +151,26 @@ __global__ void rms_norm_kernel
 //     if (column >= dim - BLOCKSIZE_X) scratch[row] = 0.0f;
 }
 
+fp_rms_norm_row_product_kernel rms_norm_row_product_kernel_pick(ExLlamaTuning* tuningParams)
+{
+    // <bool use_half2>
+    if (tuningParams->matmul_no_half2) {
+        return rms_norm_row_product_kernel<false>;
+    } else {
+        return rms_norm_row_product_kernel<true>;
+    }
+};
+
+fp_rms_norm_kernel rms_norm_kernel_pick(ExLlamaTuning* tuningParams)
+{
+    // <bool use_half2>
+    if (tuningParams->matmul_no_half2) {
+        return rms_norm_kernel<false>;
+    } else {
+        return rms_norm_kernel<true>;
+    }
+};
+
 // x = x * w / sqrt(row_mean(x * x) + epsilon)
 //
 // works in-place if x == out
@@ -163,16 +203,11 @@ void rms_norm_cuda
 
     //cudaMemsetAsync(temp, 0, rows * sizeof(float));
 
-    if (tuningParams->rmsnorm_no_half2)
-    {
-        rms_norm_row_product_kernel<false><<<blocks, threads>>>(x, temp, rows, dim);
-        rms_norm_kernel<false><<<blocks, threads>>>(x, w, out, temp, epsilon, r_dim, rows, dim);
-    }
-    else
-    {
-        rms_norm_row_product_kernel<true><<<blocks, threads>>>(x, temp, rows, dim);
-        rms_norm_kernel<true><<<blocks, threads>>>(x, w, out, temp, epsilon, r_dim, rows, dim);
-    }
+    fp_rms_norm_row_product_kernel kernel1 = rms_norm_row_product_kernel_pick(tuningParams);
+    kernel1<<<blocks, threads>>>(x, temp, rows, dim);
+
+    fp_rms_norm_kernel kernel2 = rms_norm_kernel_pick(tuningParams);
+    kernel2<<<blocks, threads>>>(x, w, out, temp, epsilon, r_dim, rows, dim);
 
     //cudaMemsetAsync(temp, 0, rows * sizeof(float));
 }

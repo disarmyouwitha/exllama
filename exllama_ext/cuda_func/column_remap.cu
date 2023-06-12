@@ -6,8 +6,8 @@ const int SHUF_BLOCKSIZE_Y = 16;
 
 __global__ void column_remap_kernel
 (
-    const half* x,
-    half* x_new,
+    const half* __restrict__ x,
+    half* __restrict__ x_new,
     const int x_width,
     const int x_height,
     const uint32_t* x_map
@@ -32,7 +32,6 @@ __global__ void column_remap_kernel
         s_idx += x_stride;
     }
 }
-
 
 // Remap columns in x to correspond to sequential group index before matmul
 //
