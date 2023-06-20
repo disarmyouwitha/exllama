@@ -3,8 +3,7 @@
 - [x] Support for act-order models ~~(a bit slow for now)~~
 - [x] ~~Support for v1 models without groupsize~~ Nah.
 - [x] Test more models
-- [ ] Consider support for loading GGML models
-- [ ] Utility to scan and validate .safetensors files
+- [x] Consider support for loading GGML models (not feasible)
 - [x] Figure out if there are quantized models with irregular groupsize (there are some at least with no groupsize)
 
 ## GPU compatibility (etc.)
@@ -22,8 +21,9 @@
 
 ## Testing
 
-- [ ] Figure out an apples-to-apples way of comparing perplexity with other implementations
+- [x] Figure out an apples-to-apples way of comparing perplexity with other implementations
 - [ ] Compile charts of inference speed vs context length for variety of models, compare to other implementations
+- [ ] Test a bunch of LoRAs to make sure all combinations of rank and target layers work
 
 ## VRAM optimization
 
@@ -41,12 +41,13 @@
 - [x] ~~Build attention mask in CUDA rather than PyTorch~~
 - [x] ~~Disable attention mask when it isn't needed~~ (not possible with SDP)
 - [x] Figure out why inference appears to be CPU-bound (kernel launch overhead)
-- [ ] Reduce no. kernel launches to minimum (tail launch, fusion etc.)
+- [x] Reduce no. kernel launches to minimum (tail launch, fusion etc.)
 - [x] Measure PyTorch module overhead (negligible in eval mode)
 - [x] Examine if scaled_dot_product_attention is actually the best attention method for single tokens (it's not)
 - [ ] Implement attention in CUDA
 - [x] Rewrite at least the quantized matmul kernel. Should be a bunch of special cases to consider
 - [x] Experiment with concurrent streams where possible (fused MLP and QKV proj.)
+- [x] Faster low-rank matmul to speed up LoRAs
 
 ## Generation
 
@@ -54,14 +55,16 @@
 - [ ] Optimized beam search
 - [ ] Multi-token censoring/de-censoring
 - [ ] Multi-token repetition penalties
-- [ ] (Multi) LoRA support
+- [x] (Multi) LoRA support
+- [ ] Allow stackable LoRAs
 - [x] Guided generation (chat with multiple bots at once, etc.)
 - [ ] Multiple chat modes with prompt templates (instruct, etc.)
+- [ ] Batched generation
 
 ## Interface
 
 - [x] Simple web interface?
-- [ ] API server 
+- [ ] API server
 
 ## Web UI
 
@@ -71,9 +74,11 @@
 - [ ] Make it a little prettier
 - [ ] Test various edge cases
 - [ ] Better error handling
+- [ ] LoRA controls
 
 ## ??
 
+- [ ] FP8/FP16 overlays
 - [ ] Allow for backpropagation
 - [ ] LoRA training features
 - [ ] Soft prompt training

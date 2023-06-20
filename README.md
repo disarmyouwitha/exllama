@@ -16,7 +16,11 @@ incompatibilities with older cards.
 * `safetensors` 0.3.1
 * `sentencepiece`
 * `ninja`
-* `flask` (only for the web UI)
+
+Additionally, only for the web UI:
+
+* `flask`
+* `waitress`
 
 ## Linux/WSL prerequisites
 
@@ -30,7 +34,7 @@ To run on Windows (without WSL):
 Studio 2022` IDE, or alternatively just the `Build Tools for Visual Studio 2022` package (make sure `Desktop
 development with C++` is ticked in the installer), it doesn't really matter which.
 2. Install the appropriate version of [PyTorch](https://pytorch.org/get-started/locally/), choosing one of the CUDA
-versions. I am developing on the nightly build, but the stable version should also work.
+versions. I am developing on the nightly build, but the stable version (2.0.1) should also work.
 3. Install CUDA Toolkit, ([11.7](https://developer.nvidia.com/cuda-11-7-0-download-archive) and 
 [11.8](https://developer.nvidia.com/cuda-11-8-0-download-archive) both seem to work, just make sure to match PyTorch's
 Compute Platform version).
@@ -53,7 +57,7 @@ a minute to compile.
 
 Chatbot example:
 
-    python test_chatbot.py -d <path_to_model_files> -un "Jeff" -p prompt_chatbort.txt
+    python example_chatbot.py -d <path_to_model_files> -un "Jeff" -p prompt_chatbort.txt
 
 ## Web UI
 
@@ -65,11 +69,12 @@ multibot mode:
 
 To run it:
 
-    pip install flask
+    pip install flask waitress
 
     python webui/app.py -d <path_to_model_files>
 
-Note that sessions are stored in `~/exllama_sessions/`. 
+Note that sessions are stored in `~/exllama_sessions/`. You can change the location of the sessions storage with `-sd`
+if you want.
 
 ## Docker
 For security benefits and easier deployment, it is also possible to run the web UI in an isolated docker container. Note: the docker image currently only supports NVIDIA GPUs.
@@ -120,11 +125,11 @@ docker run --gpus all -p 5000:5000 -v <path_to_model_files>:/app/model/ --rm -it
 |----------|------|-------|-----------------|----------------------|-----------|------------|---------|---------|------|
 | Llama    | 7B   | 128   | no              | 2,048 t              | 5,194 MB  | 13,918 t/s | 173 t/s | 140 t/s | 6.45 |
 | Llama    | 13B  | 128   | no              | 2,048 t              | 9,127 MB  | 7,507 t/s  | 102 t/s | 86 t/s  | 5.60 |
-| Llama    | 30B  | 128   | no              | 2,048 t              | 20,795 MB | 2,959 t/s  | 47 t/s  | 40 t/s  | 4.60 |
-| Llama    | 30B  | 128   | yes             | 2,048 t              | 20,795 MB | 2,784 t/s  | 45 t/s  | 37 t/s  | 4.55 |
-| Llama    | 30B  | 32    | yes             | 1,550 t <sup>1</sup> | 21,486 MB | 2,636 t/s  | 41 t/s  | 37 t/s  | 4.52 |
+| Llama    | 33B  | 128   | no              | 2,048 t              | 20,795 MB | 2,959 t/s  | 47 t/s  | 40 t/s  | 4.60 |
+| Llama    | 33B  | 128   | yes             | 2,048 t              | 20,795 MB | 2,784 t/s  | 45 t/s  | 37 t/s  | 4.55 |
+| Llama    | 33B  | 32    | yes             | 1,550 t <sup>1</sup> | 21,486 MB | 2,636 t/s  | 41 t/s  | 37 t/s  | 4.52 |
 | Koala    | 13B  | 128   | yes             | 2,048 t              | 9,127 MB  | 5,529 t/s  | 93 t/s  | 79 t/s  | 6.73 |
-| WizardLM | 30B  | -     | no <sup>2</sup> | 2,048 t              | 20,199 MB | 2,313 t/s  | 47 t/s  | 40 t/s  | 5.75 |
+| WizardLM | 33B  | -     | no <sup>2</sup> | 2,048 t              | 20,199 MB | 2,313 t/s  | 47 t/s  | 40 t/s  | 5.75 |
 
 <sup>1</sup> Can not achieve full sequence length without OoM (yet)  
 <sup>2</sup> Not quite sure if this is act-order or not. Weights have no group index, at least   
@@ -156,16 +161,16 @@ following benchmarks are from a 4090 + 3090-Ti with `-gs 17.2,24`:
 
 ### Testing long sequences
 
-The following tests were all done on **30B/65B, 4bit 128g** with various settings, just to test the max sequence length
+The following tests were all done on **33B/65B, 4bit 128g** with various settings, just to test the max sequence length
 and get a sense of what can be achieved with different or multiple GPUs right now. Llama goes incoherent generating 
 past 2048 tokens anyway, but with some fine-tuning, who knows? Note that these tests were run a while ago and the
 speeds are no longer current.
 
 |                        | Size | Seq. len. | VRAM                 | Long seq. | Ind.   | 
 |------------------------|------|-----------|----------------------|-----------|--------|
-| 4090/24GB              | 30B  | 2,516 t   | 22,145 MB            | 1140 t/s  | 28 t/s |
-| 4090/24GB + 3070Ti/8GB | 30B  | 3,932 t   | 22,055 MB + 7,377 MB | 840 t/s   | 22 t/s |
-| A6000/48GB (headless)  | 30B  | 9,032 t   | 46,863 MB            | 645 t/s   | 12 t/s |
+| 4090/24GB              | 33B  | 2,516 t   | 22,145 MB            | 1140 t/s  | 28 t/s |
+| 4090/24GB + 3070Ti/8GB | 33B  | 3,932 t   | 22,055 MB + 7,377 MB | 840 t/s   | 22 t/s |
+| A6000/48GB (headless)  | 33B  | 9,032 t   | 46,863 MB            | 645 t/s   | 12 t/s |
 | A100/80GB (headless)   | 65B  | 9,520 t   | 79,009 MB            | 650 t/s   | 9 t/s  |
 
 ## Todo
@@ -179,36 +184,28 @@ confirmed to be working right now.
 
 ## Recent updates
 
-**2023-05-24**: Added fused rotary embeddings and some minor optimizations. 13% faster on 7B, 9% on 13B. Small
-improvement on larger models. Added best-case scores to benchmark results and some clarification. For easier
-comparisons to other implementations, or whatever.
-
-**2023-05-27**: Better memory management in CUDA. Introduced auto switch between Torch's SDP backend and regular 
-matmul attention with some tweaks. Finished CUDA MLP. All in all about 10% faster with these updates.
-
-**2023-05-29**: Web UI is _almost_ up and running. Having to learn JavaScript, and it turns out I hate JavaScript. But
-ChatGPT is an incredible resource for learning new languages, I gotta say, so it's not as painful as it could have
-been. Anyway, in the process of working with the UI I discovered I've been measuring prompt speed incorrectly. Either
-Torch or CUDA or the GPU driver does some sort of caching or self-calibration or lazy initialization during the first
-pass through the model, so subsequent passes are actually _way_ faster than what I've been recording. Doesn't do much
-for individual tokens, but benchmarks updated anyway. Closing in on 10k tokens/second for 7B. (!)
-
 **2023-06-02**: Web UI is now in a fairly working state. Expect it to be a little scuffed in places. There will be a
 rewrite at some point to make the client-side code less seizure-inducing. It has multibot mode, chat rewind and editing
 features, sessions, and more. I'm going to build it out with support for instruct prompting and such, in time.
 
-**2024-06-04**: Refactored a whole bunch to move more of the work into the extension, setting up for more tuning
+**2023-06-04**: Refactored a whole bunch to move more of the work into the extension, setting up for more tuning
 options to come soon and eventually auto tuning. Also optimized a little, for about a 5% speedup.
 
-**2024-06-06**: Some minor optimizations. Also it should now compile the extension more easily and run more seamlessly
+**2023-06-06**: Some minor optimizations. Also it should now compile the extension more easily and run more seamlessly
 on Windows.
 
-**2024-06-09**: Fused most of the self-attention step. More to come. Slight speedup already, but more importantly went
+**2023-06-09**: Fused most of the self-attention step. More to come. Slight speedup already, but more importantly went
 from 69% actual CPU utilization to 37%. This should do a lot to address the bottleneck on CPUs with lower 
 single-threaded performance.
 
-**2024-06-10**: Docker support now! And some minor optimizations. Cleaned up the project a bit.
+**2023-06-10**: Docker support now! And some minor optimizations. Cleaned up the project a bit.
 
-**2024-06-11**: Added some concurrency a couple of places. It's only beneficial on the 4090, on small models where the
+**2023-06-11**: Added some concurrency a couple of places. It's only beneficial on the 4090, on small models where the
 cores are somewhat underutilized and the L2 cache can keep up. For the 3090 it's detrimental to performance, so it's
 disabled by default. YMMV. Use `-cs` to try it out.
+
+**2023-06-17**: Fixed a nasty bug in the fused attention that was causing slightly incorrect cache states on 13B and
+33B models. You definitely want to update.
+
+**2023-06-18**: LoRA support now. Still needs a lot of testing and some optimization, and currently you can't stack
+multiple LoRAs during the same inference. There's also no support in the web UI yet.

@@ -20,21 +20,24 @@ tokenizer: ExLlamaTokenizer
 cache: ExLlamaCache
 generator: ExLlamaGenerator
 
-def _sessions_dir(filename = None):
+sessions_dir: str
 
-    home_dir = os.path.expanduser("~")
-    path = os.path.join(home_dir, "exllama_sessions")
+def _sessions_dir(filename = None):
+    global sessions_dir
+
+    path = sessions_dir
     if filename is not None: path = os.path.join(path, filename)
     return path
 
 
-def prepare_sessions(_model, _tokenizer):
-    global model, tokenizer, cache, generator
+def prepare_sessions(_model, _tokenizer, _s_dir):
+    global model, tokenizer, cache, generator, sessions_dir
 
     model = _model
     tokenizer = _tokenizer
     cache = None
     generator = None
+    sessions_dir = os.path.expanduser(_s_dir)
 
     sessions_folder = _sessions_dir()
     if not os.path.exists(sessions_folder): os.makedirs(sessions_folder)
@@ -169,12 +172,13 @@ class Session:
         for jnode in loadhistory: self.history.append(Node(jnode))
 
         generator.settings.temperature = saved.get("temperature", 0.95)
-        generator.settings.top_p = saved.get("top_p", 0.65)
+        generator.settings.top_p = saved.get("top_p", 0.75)
         generator.settings.min_p = saved.get("min_p", 0.0)
-        generator.settings.top_k = saved.get("top_k", 40)
+        generator.settings.top_k = saved.get("top_k", 0)
+        generator.settings.typical = saved.get("typical", 0.25)
         self.break_on_newline = saved.get("break_on_newline", True)
         generator.settings.token_repetition_penalty_max = saved.get("token_repetition_penalty_max", 1.15)
-        generator.settings.token_repetition_penalty_sustain = saved.get("token_repetition_penalty_sustain", 1024)
+        generator.settings.token_repetition_penalty_sustain = saved.get("token_repetition_penalty_sustain", 2048)
         generator.settings.token_repetition_penalty_decay = saved.get("token_repetition_penalty_decay", 512)
 
         self.max_response_tokens = saved.get("max_response_tokens", 512)
@@ -197,6 +201,7 @@ class Session:
                     "top_p": generator.settings.top_p,
                     "min_p": generator.settings.min_p,
                     "top_k": generator.settings.top_k,
+                    "typical": generator.settings.typical,
                     "break_on_newline": self.break_on_newline,
                     "max_response_tokens": self.max_response_tokens,
                     "chunk_size": self.chunk_size,
@@ -261,9 +266,9 @@ class Session:
 
     def api_populate(self):
 
-        sessions_dir = _sessions_dir()
-        files = os.listdir(sessions_dir)
-        names = [os.path.splitext(f)[0] for f in files if os.path.isfile(os.path.join(sessions_dir, f)) and f.endswith(".json")]
+        s_dir = _sessions_dir()
+        files = os.listdir(s_dir)
+        names = [os.path.splitext(f)[0] for f in files if os.path.isfile(os.path.join(s_dir, f)) and f.endswith(".json")]
         names = sorted(names)
 
         filename = os.path.basename(self.filename)
@@ -286,6 +291,7 @@ class Session:
                 "top_p": generator.settings.top_p,
                 "min_p": generator.settings.min_p,
                 "top_k": generator.settings.top_k,
+                "typical": generator.settings.typical,
                 "break_on_newline": self.break_on_newline,
                 "max_response_tokens": self.max_response_tokens,
                 "chunk_size": self.chunk_size,
@@ -330,6 +336,22 @@ class Session:
                 return
 
 
+    def api_append_block(self, data):
+
+        author = None
+        if "author" in data:
+            author = data["author"]
+        else:
+            if len(self.participants) > 0:
+                author = self.participants[0]
+
+        text = data["text"].strip()
+
+        newNode = Node(text, author)
+        self.history.append(newNode)
+        self.save()
+
+
     def api_set_participants(self, data):
 
         self.participants = data["participants"]
@@ -349,6 +371,7 @@ class Session:
         generator.settings.top_p = data["top_p"]
         generator.settings.min_p = data["min_p"]
         generator.settings.top_k = data["top_k"]
+        generator.settings.typical = data["typical"]
         self.break_on_newline = data["gen_endnewline"]
         self.max_response_tokens = data["max_response_tokens"]
         self.chunk_size = data["chunk_size"]

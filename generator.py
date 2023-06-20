@@ -1,15 +1,18 @@
 import cuda_ext
 from model import ExLlama, ExLlamaCache
+from lora import ExLlamaLora
 import torch
+import torch.nn.functional as F
 
 class ExLlamaGenerator:
 
     class Settings:
 
         temperature = 0.95
-        top_k = 20
-        top_p = 0.65
-        min_p = 0.0  # Do not consider tokens with probability less than this
+        top_k = 40                              # consider the most probable top_k samples, 0 to disable top_k sampling
+        top_p = 0.65                            # consider tokens up to a cumulative probabiltiy of top_p, 0.0 to disable top_p sampling
+        min_p = 0.0                             # Do not consider tokens with probability less than this
+        typical = 0.0                           # Locally typical sampling threshold, 0.0 to disable typical sampling
 
         token_repetition_penalty_max = 1.15  # Repetition penalty for most recent tokens
         token_repetition_penalty_sustain = 256  # No. most recent tokens to repeat penalty for, -1 to apply to whole context
@@ -27,6 +30,7 @@ class ExLlamaGenerator:
     max_beam_length: int
     in_beam_search: True
     disallowed_tokens: list[int] or None
+    lora: ExLlamaLora or None
 
     def __init__(self, model, tokenizer, cache):
 
@@ -47,6 +51,7 @@ class ExLlamaGenerator:
         self.max_beam_length = 0
         self.in_beam_search = False
         self.disallowed_tokens = None
+        self.lora = None
 
 
     def make_rep_mask(self, penalty_max, sustain, decay):
@@ -54,7 +59,7 @@ class ExLlamaGenerator:
         return cuda_ext.ext_rep_penalty_mask_cpu(self.model.config.vocab_size, self.sequence, penalty_max, sustain, decay)
 
 
-    def sample(self, logits, temperature, top_k, top_p, min_p, num = 1):
+    def sample(self, logits, temperature, top_k, top_p, min_p, typical, num = 1):
 
         # torch.manual_seed(42)
 
@@ -73,22 +78,57 @@ class ExLlamaGenerator:
 
         # Top K
 
-        top_probs, top_indices = torch.topk(probs, top_k)
+        if top_k == 0:
+            top_probs, top_indices = torch.sort(probs, descending = True)
+        else:
+            top_probs, top_indices = torch.topk(probs, top_k)
+            top_probs = F.normalize(top_probs, p = 1, dim = -1)
 
         # Top P
 
-        num_top_p_probs = 0
-        cum_prob = top_probs[0].item()
-        while True:
-            num_top_p_probs += 1
-            if num_top_p_probs == top_probs.shape[-1]: break
-            if top_probs[num_top_p_probs].item() < min_p: break
-            cum_prob += top_probs[num_top_p_probs].item()
-            if cum_prob > top_p: break
+        if top_p > 0.0:
 
-        top_probs = top_probs[:num_top_p_probs]
-        norm_probs = top_probs / torch.sum(top_probs, dim = -1)  # Was extra softmax here (..?)
-        sampled_ind = torch.multinomial(norm_probs, norm_probs.shape[-1] if num == -1 else min(num, norm_probs.shape[-1]))
+            num_top_p_probs = 0
+            cum_prob = top_probs[0].item()
+            while True:
+                num_top_p_probs += 1
+                if num_top_p_probs == top_probs.shape[-1]: break
+                if top_probs[num_top_p_probs].item() < min_p: break
+                cum_prob += top_probs[num_top_p_probs].item()
+                if cum_prob > top_p: break
+
+            top_probs = top_probs[:num_top_p_probs]
+            top_probs = F.normalize(top_probs, p = 1, dim = -1)
+            top_indices = top_indices[:num_top_p_probs]
+
+        # Locally typical sampling
+
+        if typical > 0.0:
+
+            epsilon = 1e-10
+            log_probs = (top_probs + epsilon).log()
+            neg_entropy = (top_probs * log_probs).sum()
+            entropy_dev = (neg_entropy - log_probs).abs()
+            _, entropy_dev_order = torch.sort(entropy_dev)
+
+            top_probs = top_probs.gather(-1, entropy_dev_order)
+            top_indices = top_indices.gather(-1, entropy_dev_order)
+
+            num_typical_probs = 0
+            cum_prob = top_probs[0].item()
+            while True:
+                num_typical_probs += 1
+                if num_typical_probs == top_probs.shape[-1]: break
+                cum_prob += top_probs[num_typical_probs].item()
+                if cum_prob > typical: break
+
+            top_probs = top_probs[:num_typical_probs]
+            top_probs = F.normalize(top_probs, p = 1, dim = -1)
+            top_indices = top_indices[:num_typical_probs]
+
+        # Multinomial sampling from top_probs, kept in same order as top_indices
+
+        sampled_ind = torch.multinomial(top_probs, top_probs.shape[-1] if num == -1 else min(num, top_probs.shape[-1]))
         sampled_tokens = top_indices[sampled_ind]
         sampled_probs = top_probs[sampled_ind]  # Return probs before second norm
 
@@ -113,7 +153,7 @@ class ExLlamaGenerator:
         self.cache.current_seq_len = 0
 
         if in_tokens.shape[-1] > 1:
-            self.model.forward(self.sequence[:, :-1], self.cache, preprocess_only = True)
+            self.model.forward(self.sequence[:, :-1], self.cache, preprocess_only = True, lora = self.lora)
 
 
     def gen_begin_empty(self):
@@ -166,7 +206,7 @@ class ExLlamaGenerator:
             self.sequence = in_tokens.clone()
         else:
             self.sequence = torch.cat((self.sequence, in_tokens), dim = 1)
-        self.model.forward(self.sequence[:, start:-1], self.cache, preprocess_only = True)
+        self.model.forward(self.sequence[:, start:-1], self.cache, preprocess_only = True, lora = self.lora)
 
         self.sequence_actual = self.sequence
 
@@ -253,7 +293,7 @@ class ExLlamaGenerator:
 
     # Generate a single token with the current settings, append to sequence
 
-    def gen_single_token(self, constraints = None):
+    def gen_single_token(self, constraints = None, lora = None):
 
         self.end_beam_search()
 
@@ -265,7 +305,7 @@ class ExLlamaGenerator:
                                           self.settings.token_repetition_penalty_sustain,
                                           self.settings.token_repetition_penalty_decay)
 
-            logits = self.model.forward(self.sequence[:, -1:], self.cache)
+            logits = self.model.forward(self.sequence[:, -1:], self.cache, lora = self.lora)
             logits /= rep_mask
             logits[:, :, self.tokenizer.bos_token_id] = -10000.0
 
@@ -278,7 +318,8 @@ class ExLlamaGenerator:
                                    self.settings.temperature,
                                    self.settings.top_k,
                                    self.settings.top_p,
-                                   self.settings.min_p + 0.01 if constraints is not None else 0.0)
+                                   self.settings.min_p + 0.01 if constraints is not None else 0.0,
+                                   self.settings.typical)
 
         else:
 
@@ -442,7 +483,7 @@ class ExLlamaGenerator:
                                               self.settings.token_repetition_penalty_decay)
 
                 # self.cache.debug()
-                logits = self.model.forward(self.sequence[:, -1:], self.cache)
+                logits = self.model.forward(self.sequence[:, -1:], self.cache, lora = self.lora)
                 logits /= rep_mask
 
                 tokens, probs = self.sample(logits,
@@ -450,6 +491,7 @@ class ExLlamaGenerator:
                                             self.settings.top_k,
                                             self.settings.top_p,
                                             self.settings.min_p,
+                                            self.settings.typical,
                                             num = self.settings.beams)
 
                 # self.cache is updated with k/v for last token
@@ -475,7 +517,7 @@ class ExLlamaGenerator:
                                                   self.settings.token_repetition_penalty_decay)
 
                     # self.cache.debug()
-                    logits = self.model.forward(self.sequence[:, -1:], self.cache)
+                    logits = self.model.forward(self.sequence[:, -1:], self.cache, lora = self.lora)
                     logits /= rep_mask
 
                     tokens, probs = self.sample(logits,
@@ -483,6 +525,7 @@ class ExLlamaGenerator:
                                                 self.settings.top_k,
                                                 self.settings.top_p,
                                                 self.settings.min_p,
+                                                self.settings.typical,
                                                 num = -1)
 
                     beam.sampled_tokens = tokens
